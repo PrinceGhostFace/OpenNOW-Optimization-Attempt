@@ -63,12 +63,3 @@ OpenNOW is a custom GeForce NOW client rewritten entirely in **Native Rust** for
 **Requirements:**
 - Rust toolchain (1.75+)
 - FFmpeg development libraries (v6.1+ recommended)
-- `pkg-config`
-
-```bash
-# Clone this optimized fork
-git clone [https://github.com/YOUR_USERNAME/OpenNOW-Optimized.git](https://github.com/PrinceGhostFace/OpenNOW-Optimized.git)
-cd OpenNOW-Optimized/opennow-streamer
-
-# Build in release mode for maximum performance
-cargo build --release
