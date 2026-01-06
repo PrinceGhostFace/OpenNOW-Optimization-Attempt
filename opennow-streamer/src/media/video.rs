@@ -1401,24 +1401,28 @@ impl VideoDecoder {
     ) -> Option<VideoFrame> {
         // AV1 uses OBUs directly, no start codes needed
         // H.264/H.265 need Annex B start codes (0x00 0x00 0x00 0x01)
-        let data = if codec_id == ffmpeg::codec::Id::AV1 {
-            // AV1 - use data as-is (OBU format)
-            data.to_vec()
-        } else if data.len() >= 4 && data[0..4] == [0, 0, 0, 1] {
-            data.to_vec()
-        } else if data.len() >= 3 && data[0..3] == [0, 0, 1] {
-            data.to_vec()
+        
+        // OPTIMIZATION: Write directly to Packet to avoid intermediate Vec allocation
+        let needs_start_code = if codec_id == ffmpeg::codec::Id::AV1 {
+            false
         } else {
-            // Add start code for H.264/H.265
-            let mut with_start = vec![0, 0, 0, 1];
-            with_start.extend_from_slice(data);
-            with_start
+            !(data.len() >= 4 && data[0..4] == [0, 0, 0, 1]) && 
+            !(data.len() >= 3 && data[0..3] == [0, 0, 1])
         };
 
-        // Create packet
-        let mut packet = Packet::new(data.len());
+        let packet_size = if needs_start_code { data.len() + 4 } else { data.len() };
+        let mut packet = Packet::new(packet_size);
+        
         if let Some(pkt_data) = packet.data_mut() {
-            pkt_data.copy_from_slice(&data);
+            if needs_start_code {
+                pkt_data[0] = 0;
+                pkt_data[1] = 0;
+                pkt_data[2] = 0;
+                pkt_data[3] = 1;
+                pkt_data[4..].copy_from_slice(data);
+            } else {
+                pkt_data.copy_from_slice(data);
+            }
         } else {
             warn!("Failed to allocate packet data");
             return None;
@@ -1598,22 +1602,32 @@ impl VideoDecoder {
                                 w, h, y_stride, uv_stride, y_data.len(), uv_data.len());
                         }
 
-                        // Optimized copy - fast path when strides match
-                        let copy_plane_fast = |src: &[u8], src_stride: u32, dst_stride: u32, copy_width: u32, height: u32| -> Vec<u8> {
+                        // OPTIMIZATION: Optimized plane copy - use bulk copy when strides match, row-by-row otherwise
+                        let copy_plane_fast = |src: &[u8], src_stride: u32, dst_stride: u32, width: u32, height: u32| -> Vec<u8> {
                             let total_size = (dst_stride * height) as usize;
+
+                            // Fast path: single memcpy with NO zero-initialization
                             if src_stride == dst_stride && src.len() >= total_size {
-                                // Fast path: single memcpy
-                                src[..total_size].to_vec()
+                                let mut dst = Vec::with_capacity(total_size);
+                                unsafe {
+                                    // SAFETY: We immediately copy valid data into the entire buffer
+                                    dst.set_len(total_size);
+                                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), total_size);
+                                }
+                                dst
                             } else {
-                                // Slow path: row-by-row
+                                // Slow path: row-by-row (keep safe initialization for padding)
                                 let mut dst = vec![0u8; total_size];
+                                let width = width as usize;
+                                let src_stride = src_stride as usize;
+                                let dst_stride = dst_stride as usize;
+
                                 for row in 0..height as usize {
-                                    let src_start = row * src_stride as usize;
-                                    let src_end = src_start + copy_width as usize;
-                                    let dst_start = row * dst_stride as usize;
+                                    let src_start = row * src_stride;
+                                    let src_end = src_start + width;
+                                    let dst_start = row * dst_stride;
                                     if src_end <= src.len() {
-                                        dst[dst_start..dst_start + copy_width as usize]
-                                            .copy_from_slice(&src[src_start..src_end]);
+                                        dst[dst_start..dst_start + width].copy_from_slice(&src[src_start..src_end]);
                                     }
                                 }
                                 dst
@@ -1699,16 +1713,21 @@ impl VideoDecoder {
 
                 let uv_height = h / 2;
 
-                // Optimized plane copy - use bulk copy when strides match, row-by-row otherwise
+                // OPTIMIZATION: Optimized plane copy - use bulk copy when strides match, row-by-row otherwise
                 let copy_plane_optimized = |src: &[u8], src_stride: u32, dst_stride: u32, width: u32, height: u32| -> Vec<u8> {
                     let total_size = (dst_stride * height) as usize;
 
-                    // Fast path: if source stride equals destination stride AND covers the data we need,
-                    // we can do a single memcpy
+                    // Fast path: single memcpy with NO zero-initialization
                     if src_stride == dst_stride && src.len() >= total_size {
-                        src[..total_size].to_vec()
+                        let mut dst = Vec::with_capacity(total_size);
+                        unsafe {
+                            // SAFETY: We immediately copy valid data into the entire buffer
+                            dst.set_len(total_size);
+                            std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), total_size);
+                        }
+                        dst
                     } else {
-                        // Slow path: row-by-row copy with stride conversion
+                        // Slow path: row-by-row (keep safe initialization for padding)
                         let mut dst = vec![0u8; total_size];
                         let width = width as usize;
                         let src_stride = src_stride as usize;
@@ -1777,11 +1796,10 @@ impl VideoDecoder {
     /// The decoded frame will be written directly to the SharedFrame.
     /// Stats are sent via the stats channel returned from `new_async()`.
     /// 
-    /// This method NEVER blocks the calling thread, making it ideal for
-    /// the main streaming loop where input responsiveness is critical.
-    pub fn decode_async(&mut self, data: &[u8], receive_time: std::time::Instant) -> Result<()> {
+    /// OPTIMIZATION: Takes Vec<u8> by value to consume network buffer without copying
+    pub fn decode_async(&mut self, data: Vec<u8>, receive_time: std::time::Instant) -> Result<()> {
         self.cmd_tx.send(DecoderCommand::DecodeAsync {
-            data: data.to_vec(),
+            data, // Move, don't copy!
             receive_time,
         }).map_err(|_| anyhow!("Decoder thread closed"))?;
 
