@@ -661,7 +661,8 @@ pub async fn run_streaming(
                                 rtp_depacketizer.flush_pending_obu();
 
                                 if let Some(frame_data) = rtp_depacketizer.take_accumulated_frame() {
-                                    if let Err(e) = video_decoder.decode_async(&frame_data, packet_receive_time) {
+                                    // OPTIMIZATION: Pass data by value (no &) to consume buffer
+                                    if let Err(e) = video_decoder.decode_async(frame_data, packet_receive_time) {
                                         warn!("Decode async failed: {}", e);
                                     }
                                 }
@@ -679,7 +680,8 @@ pub async fn run_streaming(
                             // On marker bit, we have a complete Access Unit - send to decoder
                             if marker {
                                 if let Some(frame_data) = rtp_depacketizer.take_nal_frame() {
-                                    if let Err(e) = video_decoder.decode_async(&frame_data, packet_receive_time) {
+                                    // OPTIMIZATION: Pass data by value (no &) to consume buffer
+                                    if let Err(e) = video_decoder.decode_async(frame_data, packet_receive_time) {
                                         warn!("Decode async failed: {}", e);
                                     }
                                 }
